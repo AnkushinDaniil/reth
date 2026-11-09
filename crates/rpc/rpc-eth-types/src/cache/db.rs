@@ -11,26 +11,28 @@ use evm2::{
         AccountChangeRef, Bal as EvmBal, CacheDB, Db, DynDatabase, StateChangeSink, StorageChange,
     },
 };
+use parking_lot::RwLock;
 use reth_evm::{database::StateProviderDatabase, BundleState, EvmEnv};
 use reth_execution_types::{BlockState, TransactionChanges};
 use reth_storage_api::{EvmStateProviderAdapter, StateProviderBox};
 use schnellru::{ByLength, LruMap};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock};
 
 /// Helper alias type for cached state access.
 pub type StateCacheDb =
     CacheDB<Db<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>>;
 
 /// Maximum number of code overrides kept in [`OVERRIDE_BYTECODES`].
-const OVERRIDE_BYTECODES_CAPACITY: u32 = 64;
+const OVERRIDE_BYTECODES_CAPACITY: u32 = 16;
 
 /// Bytecode of recently applied code overrides, keyed by the override code.
 ///
 /// Callers often override the same contract code on every request. Reusing its [`Bytecode`] keeps
 /// the code hash and jump table, which are otherwise recomputed for every request. Only code up to
-/// [`MAX_CODE_SIZE_AMSTERDAM`] is cached, which bounds the cache's memory.
-static OVERRIDE_BYTECODES: LazyLock<Mutex<LruMap<Bytes, Bytecode>>> =
-    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(OVERRIDE_BYTECODES_CAPACITY))));
+/// [`MAX_CODE_SIZE_AMSTERDAM`] is cached, which bounds the cache's memory. Lookups take the read
+/// lock and do not refresh an entry, so the earliest inserted code is evicted first.
+static OVERRIDE_BYTECODES: LazyLock<RwLock<LruMap<Bytes, Bytecode>>> =
+    LazyLock::new(|| RwLock::new(LruMap::new(ByLength::new(OVERRIDE_BYTECODES_CAPACITY))));
 
 /// Applies RPC block overrides to an evm2 environment and state cache.
 pub fn apply_block_overrides<DB>(
@@ -190,19 +192,14 @@ fn override_bytecode(code: Bytes) -> Result<Bytecode, BytecodeDecodeError> {
     if code.len() > MAX_CODE_SIZE_AMSTERDAM {
         return Bytecode::new_raw_checked(code)
     }
-    if let Some(bytecode) =
-        OVERRIDE_BYTECODES.lock().unwrap_or_else(PoisonError::into_inner).get(&code)
-    {
+    if let Some(bytecode) = OVERRIDE_BYTECODES.read().peek(&code) {
         return Ok(bytecode.clone())
     }
 
     // Hash outside the lock so concurrent requests do not wait on it.
     let bytecode = Bytecode::new_raw_checked(code.clone())?;
     bytecode.hash_slow();
-    OVERRIDE_BYTECODES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(code, bytecode.clone());
+    OVERRIDE_BYTECODES.write().insert(code, bytecode.clone());
     Ok(bytecode)
 }
 
