@@ -2,10 +2,11 @@
 
 use crate::error::StateOverrideError;
 use alloy_eip7928::{bal::DecodedBal, BlockAccessIndex};
-use alloy_primitives::U256;
+use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
 use evm2::{
-    bytecode::Bytecode,
+    bytecode::{Bytecode, BytecodeDecodeError},
+    constants::MAX_CODE_SIZE_AMSTERDAM,
     evm::{
         AccountChangeRef, Bal as EvmBal, CacheDB, Db, DynDatabase, StateChangeSink, StorageChange,
     },
@@ -13,11 +14,23 @@ use evm2::{
 use reth_evm::{database::StateProviderDatabase, BundleState, EvmEnv};
 use reth_execution_types::{BlockState, TransactionChanges};
 use reth_storage_api::{EvmStateProviderAdapter, StateProviderBox};
-use std::sync::Arc;
+use schnellru::{ByLength, LruMap};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 /// Helper alias type for cached state access.
 pub type StateCacheDb =
     CacheDB<Db<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>>;
+
+/// Maximum number of code overrides kept in [`OVERRIDE_BYTECODES`].
+const OVERRIDE_BYTECODES_CAPACITY: u32 = 64;
+
+/// Bytecode of recently applied code overrides, keyed by the override code.
+///
+/// Callers often override the same contract code on every request. Reusing its [`Bytecode`] keeps
+/// the code hash and jump table, which are otherwise recomputed for every request. Only code up to
+/// [`MAX_CODE_SIZE_AMSTERDAM`] is cached, which bounds the cache's memory.
+static OVERRIDE_BYTECODES: LazyLock<Mutex<LruMap<Bytes, Bytecode>>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(OVERRIDE_BYTECODES_CAPACITY))));
 
 /// Applies RPC block overrides to an evm2 environment and state cache.
 pub fn apply_block_overrides<DB>(
@@ -94,7 +107,7 @@ pub fn apply_state_overrides_with_state<DB: DynDatabase>(
             account.nonce = nonce;
         }
         if let Some(code) = account_override.code {
-            account.set_code(Bytecode::new_raw_checked(code)?);
+            account.set_code(override_bytecode(code)?);
         }
         if let Some(balance) = account_override.balance {
             account.balance = balance;
@@ -171,6 +184,28 @@ pub fn apply_state_overrides_with_state<DB: DynDatabase>(
     Ok(())
 }
 
+/// Returns the [`Bytecode`] for override `code`, reusing the one of an earlier override of the same
+/// code.
+fn override_bytecode(code: Bytes) -> Result<Bytecode, BytecodeDecodeError> {
+    if code.len() > MAX_CODE_SIZE_AMSTERDAM {
+        return Bytecode::new_raw_checked(code)
+    }
+    if let Some(bytecode) =
+        OVERRIDE_BYTECODES.lock().unwrap_or_else(PoisonError::into_inner).get(&code)
+    {
+        return Ok(bytecode.clone())
+    }
+
+    // Hash outside the lock so concurrent requests do not wait on it.
+    let bytecode = Bytecode::new_raw_checked(code.clone())?;
+    bytecode.hash_slow();
+    OVERRIDE_BYTECODES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(code, bytecode.clone());
+    Ok(bytecode)
+}
+
 /// Attaches `bal` to the database, positioned at the state right before the transaction at
 /// `tx_index`.
 ///
@@ -196,7 +231,7 @@ mod tests {
 
     use super::*;
     use alloy_eip7928::{BalanceChange, StorageChange};
-    use alloy_primitives::{Address, Bytes, B256, U256};
+    use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
     use alloy_rpc_types_eth::state::AccountOverride;
     use evm2::evm::{AccountBal, AccountInfo, Bal, BalChanges, InMemoryDB};
 
@@ -247,6 +282,17 @@ mod tests {
             .info
             .as_ref()
             .is_some_and(|info| info.is_empty()));
+    }
+
+    #[test]
+    fn code_overrides_reuse_bytecode() {
+        let code = Bytes::from_static(&[0x60, 0x01, 0x5b, 0x00]);
+        let first = override_bytecode(code.clone()).unwrap();
+        let second = override_bytecode(code.clone()).unwrap();
+
+        // Both overrides share one allocation, and with it the code hash and jump table.
+        assert_eq!(first.original_byte_slice().as_ptr(), second.original_byte_slice().as_ptr());
+        assert_eq!(second.hash_slow(), keccak256(&code));
     }
 
     #[test]
