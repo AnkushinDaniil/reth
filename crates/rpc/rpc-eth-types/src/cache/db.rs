@@ -2,7 +2,7 @@
 
 use crate::error::StateOverrideError;
 use alloy_eip7928::{bal::DecodedBal, BlockAccessIndex};
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{map::DefaultHashBuilder, Bytes, U256};
 use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
 use evm2::{
     bytecode::{Bytecode, BytecodeDecodeError},
@@ -11,28 +11,28 @@ use evm2::{
         AccountChangeRef, Bal as EvmBal, CacheDB, Db, DynDatabase, StateChangeSink, StorageChange,
     },
 };
-use parking_lot::RwLock;
+use fixed_cache::Cache;
 use reth_evm::{database::StateProviderDatabase, BundleState, EvmEnv};
 use reth_execution_types::{BlockState, TransactionChanges};
 use reth_storage_api::{EvmStateProviderAdapter, StateProviderBox};
-use schnellru::{ByLength, LruMap};
 use std::sync::{Arc, LazyLock};
 
 /// Helper alias type for cached state access.
 pub type StateCacheDb =
     CacheDB<Db<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>>;
 
-/// Maximum number of code overrides kept in [`OVERRIDE_BYTECODES`].
-const OVERRIDE_BYTECODES_CAPACITY: u32 = 16;
+/// Number of code overrides kept in [`OVERRIDE_BYTECODES`].
+const OVERRIDE_BYTECODES_CAPACITY: usize = 256;
 
 /// Bytecode of recently applied code overrides, keyed by the override code.
 ///
 /// Callers often override the same contract code on every request. Reusing its [`Bytecode`] keeps
-/// the code hash and jump table, which are otherwise recomputed for every request. Only code up to
-/// [`MAX_CODE_SIZE_AMSTERDAM`] is cached, which bounds the cache's memory. Lookups take the read
-/// lock and do not refresh an entry, so the earliest inserted code is evicted first.
-static OVERRIDE_BYTECODES: LazyLock<RwLock<LruMap<Bytes, Bytecode>>> =
-    LazyLock::new(|| RwLock::new(LruMap::new(ByLength::new(OVERRIDE_BYTECODES_CAPACITY))));
+/// the code hash and jump table, which are otherwise recomputed for every request. Each code maps
+/// to one slot: a different code hashing to the same slot replaces it, and a lookup that races
+/// another access to its slot misses. Only code up to [`MAX_CODE_SIZE_AMSTERDAM`] is cached, which
+/// bounds the cache to about 18 MiB.
+static OVERRIDE_BYTECODES: LazyLock<Cache<Bytes, Bytecode, DefaultHashBuilder>> =
+    LazyLock::new(|| Cache::new(OVERRIDE_BYTECODES_CAPACITY, DefaultHashBuilder::default()));
 
 /// Applies RPC block overrides to an evm2 environment and state cache.
 pub fn apply_block_overrides<DB>(
@@ -189,17 +189,17 @@ pub fn apply_state_overrides_with_state<DB: DynDatabase>(
 /// Returns the [`Bytecode`] for override `code`, reusing the one of an earlier override of the same
 /// code.
 fn override_bytecode(code: Bytes) -> Result<Bytecode, BytecodeDecodeError> {
-    if code.len() > MAX_CODE_SIZE_AMSTERDAM {
+    if code.is_empty() || code.len() > MAX_CODE_SIZE_AMSTERDAM {
         return Bytecode::new_raw_checked(code)
     }
-    if let Some(bytecode) = OVERRIDE_BYTECODES.read().peek(&code) {
-        return Ok(bytecode.clone())
+    if let Some(bytecode) = OVERRIDE_BYTECODES.get(&code) {
+        return Ok(bytecode)
     }
 
-    // Hash outside the lock so concurrent requests do not wait on it.
-    let bytecode = Bytecode::new_raw_checked(code.clone())?;
+    let bytecode = Bytecode::new_raw_checked(code)?;
     bytecode.hash_slow();
-    OVERRIDE_BYTECODES.write().insert(code, bytecode.clone());
+    // The key shares the bytecode's buffer, so the cache holds each code once.
+    OVERRIDE_BYTECODES.insert(bytecode.original_bytes(), bytecode.clone());
     Ok(bytecode)
 }
 
